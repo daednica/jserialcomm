@@ -1,0 +1,106 @@
+name: Release to Maven Central
+
+on: [workflow_dispatch]
+
+jobs:
+  buildpublish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v3
+
+      - name: Get source code version number
+        id: gitversion
+        run: echo "version=$(grep -o "versionString = [^, ;]*" src/main/java/com/fazecast/jSerialComm/SerialPort.java | grep -o "\".*\"" | grep -o [^\"].*[^\"])" >> $GITHUB_OUTPUT
+
+      - name: Update library version string
+        run: |
+          sed -i "s/@version .*/@version ${{ steps.gitversion.outputs.version }}/" src/main/java/com/fazecast/jSerialComm/package-info.java
+          sed -i "s/nativeLibraryVersion\[\] = [^, ;]*/nativeLibraryVersion\[\] = \"${{ steps.gitversion.outputs.version }}\"/g" src/main/c/Posix/SerialPort_Posix.c
+          sed -i "s/nativeLibraryVersion\[\] = [^, ;]*/nativeLibraryVersion\[\] = \"${{ steps.gitversion.outputs.version }}\"/g" src/main/c/Windows/SerialPort_Windows.c
+
+      - name: Build native libraries using Docker toolchain
+        uses: addnab/docker-run-action@v3
+        with:
+          image: fazecast/jserialcomm:builder
+          options: --user root --privileged --rm -v ${{ github.workspace }}:/home/toolchain/jSerialComm
+          run: /home/toolchain/compile.sh libs
+
+      - name: Set up Java build environment
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '11'
+
+      - name: Build library using Gradle
+        uses: gradle/gradle-build-action@v2.4.2
+        env:
+          LIB_VERSION: ${{ steps.gitversion.outputs.version }}
+        with:
+          gradle-version: 8.1.1
+          arguments: build
+
+      - name: Publish library using Gradle
+        uses: gradle/gradle-build-action@v2.4.2
+        env:
+          LIB_VERSION: ${{ steps.gitversion.outputs.version }}
+          MAVEN_USERNAME: ${{ secrets.OSS_SONATYPE_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.OSS_SONATYPE_PASSWORD }}
+          SIGNING_KEY: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        with:
+          gradle-version: 8.1.1
+          arguments: publish
+
+      - name: Generate changelog
+        id: changelog
+        uses: metcalfc/changelog-generator@v4.1.0
+        with:
+          myToken: ${{ secrets.GRADLE_UPDATE_PAT }}
+
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ secrets.GRADLE_UPDATE_PAT }}
+          name: "jSerialComm v${{ steps.gitversion.outputs.version }}"
+          tag: "v${{ steps.gitversion.outputs.version }}"
+          body: ${{ steps.changelog.outputs.changelog }}
+          commit: "master"
+          artifacts: "build/libs/jSerialComm-${{ steps.gitversion.outputs.version }}.jar"
+          generateReleaseNotes: false
+          prerelease: false
+          makeLatest: true
+          draft: true
+
+      - name: Check out library documentation
+        uses: actions/checkout@v3
+        with:
+          ref: gh-pages
+          path: documentation
+
+      - name: Update Javadoc library documentation
+        run: rm -rf documentation/binaries/* documentation/javadoc && mv build/docs/javadoc documentation/ && sed -i "s@content/com/fazecast/jSerialComm/[^\"]*@content/com/fazecast/jSerialComm/${{ steps.gitversion.outputs.version }}/jSerialComm-${{ steps.gitversion.outputs.version }}.jar@g" documentation/index.html
+
+      - name: Publish new library documentation
+        uses: s0/git-publish-subdir-action@v2.6.0
+        env:
+          REPO: self
+          BRANCH: gh-pages
+          FOLDER: documentation
+          GITHUB_TOKEN: ${{ secrets.GRADLE_UPDATE_PAT }}
+          MESSAGE: "Updated docs to v${{ steps.gitversion.outputs.version }}"
+
+      - name: Check out Wiki source data
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: markdown
+
+      - name: Update and publish Wiki release link
+        run: |
+          cd markdown
+          sed -i "s@\*\*Current Version\*\*:.*@\*\*Current Version\*\*: \*${{ steps.gitversion.outputs.version }}\* ([[Download JAR file here|https://oss.sonatype.org/service/local/repositories/releases/content/com/fazecast/jSerialComm/${{ steps.gitversion.outputs.version }}/jSerialComm-${{ steps.gitversion.outputs.version }}.jar]])@" Home.md
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .
+          git diff-index --quiet HEAD || git commit -m "New jSerialComm release version" && git push
